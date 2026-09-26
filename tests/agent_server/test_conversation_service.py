@@ -2738,6 +2738,51 @@ class TestConversationServiceUpdateConversation:
 
         assert mock_service.stored.updated_at > original_updated_at
 
+    @pytest.mark.asyncio
+    async def test_update_conversation_leaves_stored_unchanged_when_save_meta_fails(
+        self, conversation_service, sample_stored_conversation
+    ):
+        """Failed persist must not leave in-memory title/tags ahead of disk."""
+        sample_stored_conversation.title = "Original Title"
+        sample_stored_conversation.tags = {"env": "dev"}
+        mock_service = AsyncMock(spec=EventService)
+        mock_service.stored = sample_stored_conversation
+        mock_service.save_meta.side_effect = RuntimeError("disk full")
+        mock_state = ConversationState(
+            id=sample_stored_conversation.id,
+            agent=_sample_agent(),
+            workspace=sample_stored_conversation.workspace,
+            execution_status=ConversationExecutionStatus.IDLE,
+            confirmation_policy=sample_stored_conversation.confirmation_policy,
+            tags={"env": "dev"},
+        )
+        mock_service.get_state.return_value = mock_state
+
+        conversation_id = sample_stored_conversation.id
+        conversation_service._event_services[conversation_id] = mock_service
+        conversation_service._conversation_records[conversation_id] = (
+            _ConversationRecord(
+                stored=sample_stored_conversation,
+                execution_status=ConversationExecutionStatus.IDLE,
+            )
+        )
+
+        original_updated_at = mock_service.stored.updated_at
+        with pytest.raises(RuntimeError, match="disk full"):
+            await conversation_service.update_conversation(
+                conversation_id,
+                UpdateConversationRequest(title="New Title", tags={"env": "prod"}),
+            )
+
+        assert mock_service.stored.title == "Original Title"
+        assert mock_service.stored.tags == {"env": "dev"}
+        assert mock_service.stored.updated_at == original_updated_at
+        assert mock_state.tags == {"env": "dev"}
+        record = conversation_service._conversation_records[conversation_id]
+        assert record.stored.title == "Original Title"
+        assert record.stored.tags == {"env": "dev"}
+        assert record.stored.updated_at == original_updated_at
+
 
 class TestConversationServiceDeleteConversation:
     """Test cases for ConversationService.delete_conversation method."""
@@ -3209,6 +3254,22 @@ class TestAutoTitle:
         service.save_meta.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_autotitle_leaves_title_unchanged_when_save_meta_fails(self):
+        """Failed persist must not leave the generated title in memory."""
+        service = self._make_service()
+        original_updated_at = service.stored.updated_at
+        service.save_meta.side_effect = RuntimeError("disk full")
+
+        with patch(self._GENERATE_TITLE_PATH, return_value="✨ Generated Title"):
+            subscriber = AutoTitleSubscriber(service=service)
+            await subscriber(self._user_message_event())
+            await self._drain_title_task(lambda: service.save_meta.called)
+
+        assert service.stored.title is None
+        assert service.stored.updated_at == original_updated_at
+        service.save_meta.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_autotitle_skips_non_user_events(self):
         """Non-user events do not trigger title generation.
 
@@ -3634,13 +3695,11 @@ class TestACPActivityHeartbeatWiring:
 
 
 @pytest.mark.asyncio
-async def test_external_catalog_sync_discovers_conversation_added_after_startup(
+async def test_refresh_persisted_conversation_adds_and_removes_record(
     tmp_path, sample_stored_conversation
 ):
     conversations_dir = tmp_path / "conversations"
-    async with ConversationService(
-        conversations_dir=conversations_dir, sync_external_catalog=True
-    ) as service:
+    async with ConversationService(conversations_dir=conversations_dir) as service:
         assert (await service.search_conversations()).items == []
 
         conversation_dir = conversations_dir / sample_stored_conversation.id.hex
@@ -3656,9 +3715,11 @@ async def test_external_catalog_sync_discovers_conversation_added_after_startup(
         )
         (conversation_dir / "base_state.json").write_text(state.model_dump_json())
 
+        await service.refresh_persisted_conversation(sample_stored_conversation.id)
         info = await service.get_conversation(sample_stored_conversation.id)
         page = await service.search_conversations()
         (conversation_dir / "meta.json").unlink()
+        await service.refresh_persisted_conversation(sample_stored_conversation.id)
         removed = await service.get_conversation(sample_stored_conversation.id)
 
     assert info is not None
@@ -4201,14 +4262,12 @@ async def test_search_live_conversation_does_not_wait_for_state_lock(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_external_catalog_refreshes_metadata_without_state_change(
+async def test_refresh_persisted_conversation_updates_metadata_without_state_change(
     persisted_conversation,
 ):
     conversations_dir, conversation_id = persisted_conversation
     directory = conversations_dir / conversation_id.hex
-    async with ConversationService(
-        conversations_dir=conversations_dir, sync_external_catalog=True
-    ) as service:
+    async with ConversationService(conversations_dir=conversations_dir) as service:
         initial = await service.search_conversations()
         assert initial.items[0].title is None
         state_before = (directory / "base_state.json").read_bytes()
@@ -4216,6 +4275,7 @@ async def test_external_catalog_refreshes_metadata_without_state_change(
         metadata["title"] = "Generated externally"
         (directory / "meta.json").write_text(json.dumps(metadata))
 
+        await service.refresh_persisted_conversation(conversation_id)
         info = await service.get_conversation(conversation_id)
         assert info is not None
         assert info.title == "Generated externally"
@@ -4224,11 +4284,11 @@ async def test_external_catalog_refreshes_metadata_without_state_change(
 
 
 @pytest.mark.asyncio
-async def test_external_catalog_preserves_live_metadata(persisted_conversation):
+async def test_refresh_persisted_conversation_preserves_live_metadata(
+    persisted_conversation,
+):
     conversations_dir, conversation_id = persisted_conversation
-    async with ConversationService(
-        conversations_dir=conversations_dir, sync_external_catalog=True
-    ) as service:
+    async with ConversationService(conversations_dir=conversations_dir) as service:
         runtime = await service.get_event_service(conversation_id)
         assert runtime is not None
         runtime.stored = runtime.stored.model_copy(update={"title": "Live title"})
@@ -4237,6 +4297,7 @@ async def test_external_catalog_preserves_live_metadata(persisted_conversation):
         metadata["title"] = "Stale disk title"
         metadata_path.write_text(json.dumps(metadata))
 
+        await service.refresh_persisted_conversation(conversation_id)
         info = await service.get_conversation(conversation_id)
         assert info is not None
         assert info.title == "Live title"
@@ -4245,7 +4306,9 @@ async def test_external_catalog_preserves_live_metadata(persisted_conversation):
 
 
 @pytest.mark.asyncio
-async def test_external_lookup_only_decrypts_requested_record(persisted_conversation):
+async def test_refresh_persisted_conversation_only_decrypts_requested_record(
+    persisted_conversation,
+):
     conversations_dir, conversation_id = persisted_conversation
     reads = []
 
@@ -4255,7 +4318,6 @@ async def test_external_lookup_only_decrypts_requested_record(persisted_conversa
 
     async with ConversationService(
         conversations_dir=conversations_dir,
-        sync_external_catalog=True,
         runtime_cipher_resolver=cipher_for,
     ) as service:
         unrelated = uuid4()
@@ -4265,5 +4327,11 @@ async def test_external_lookup_only_decrypts_requested_record(persisted_conversa
             (conversations_dir / conversation_id.hex / "meta.json").read_bytes()
         )
         reads.clear()
+        assert (await service.search_conversations()).items
+        assert reads == [conversation_id]
+
+        reads.clear()
+        await service.refresh_persisted_conversation(conversation_id)
+        assert reads == [conversation_id]
         assert await service.get_conversation(conversation_id) is not None
-        assert unrelated not in reads
+        assert reads == [conversation_id]

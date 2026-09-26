@@ -565,6 +565,19 @@ def _update_state_tags_sync(
     return state
 
 
+async def _persist_stored(
+    event_service: EventService, stored: StoredConversation
+) -> None:
+    """Write ``stored`` to meta.json, then commit it in memory.
+
+    ``save_meta`` persists the given payload without mutating
+    ``event_service.stored``. In-memory state is updated only after the
+    write succeeds so a failed persist cannot leave memory ahead of disk.
+    """
+    await event_service.save_meta(stored)
+    event_service.stored = stored
+
+
 def _compose_webhook_conversation_info_sync(
     stored: StoredConversation, state: ConversationState
 ) -> ConversationInfo:
@@ -704,7 +717,6 @@ class ConversationService:
         default=Path("/tmp/conversation-worktrees")
     )
     acp_skill_sourcing: ACPSkillSourcing = "native"
-    sync_external_catalog: bool = False
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -1108,34 +1120,31 @@ class ConversationService:
             record.cached_info = None
             record.state_signature = signature
 
-    async def _reconcile_active_records(
-        self, conversation_id: UUID | None = None
-    ) -> None:
-        """Discover externally persisted records and injected live services."""
+    async def refresh_persisted_conversation(self, conversation_id: UUID) -> None:
+        """Refresh one catalog record changed by an external runtime."""
         event_services = self._event_services
         if event_services is None:
             raise ValueError("inactive_service")
-        if self.sync_external_catalog:
-            disk_records = await asyncio.to_thread(
-                self._load_catalog_sync, conversation_id
-            )
-            stale_ids = (
-                {conversation_id}
-                if conversation_id is not None
-                else set(self._conversation_records)
-            ) - set(disk_records)
-            for record_id in stale_ids:
-                event_service = event_services.get(record_id)
-                if event_service is None or not event_service.is_open():
-                    self._conversation_records.pop(record_id, None)
-            for record_id, record in disk_records.items():
-                event_service = event_services.get(record_id)
-                if event_service is not None and event_service.is_open():
-                    continue
-                existing = self._conversation_records.setdefault(record_id, record)
-                if existing.stored != record.stored:
-                    existing.stored = record.stored
-                    existing.cached_info = None
+        disk_records = await asyncio.to_thread(self._load_catalog_sync, conversation_id)
+        if conversation_id not in disk_records:
+            event_service = event_services.get(conversation_id)
+            if event_service is None or not event_service.is_open():
+                self._conversation_records.pop(conversation_id, None)
+            return
+        record = disk_records[conversation_id]
+        event_service = event_services.get(conversation_id)
+        if event_service is not None and event_service.is_open():
+            return
+        existing = self._conversation_records.setdefault(conversation_id, record)
+        if existing.stored != record.stored:
+            existing.stored = record.stored
+            existing.cached_info = None
+
+    async def _reconcile_active_records(self) -> None:
+        """Add injected live services to the in-memory catalog."""
+        event_services = self._event_services
+        if event_services is None:
+            raise ValueError("inactive_service")
         for conversation_id, event_service in event_services.items():
             if conversation_id in self._conversation_records:
                 continue
@@ -1270,8 +1279,6 @@ class ConversationService:
     async def get_conversation(self, conversation_id: UUID) -> ConversationInfo | None:
         if self._event_services is None:
             raise ValueError("inactive_service")
-        if self.sync_external_catalog:
-            await self._reconcile_active_records(conversation_id)
         record = self._conversation_records.get(conversation_id)
         if record is None:
             event_service = self._event_services.get(conversation_id)
@@ -2001,22 +2008,24 @@ class ConversationService:
 
         loop = asyncio.get_running_loop()
         state = await event_service.get_state()
+        updates: dict[str, Any] = {"updated_at": utc_now()}
         if request.title is not None:
-            event_service.stored.title = request.title.strip()
+            updates["title"] = request.title.strip()
         if request.tags is not None:
-            event_service.stored.tags = request.tags
+            updates["tags"] = request.tags
+        await _persist_stored(
+            event_service, event_service.stored.model_copy(update=updates)
+        )
+        if request.tags is not None:
             # Keep the persisted ConversationState update under the state lock so
             # autosave and state-change callbacks observe a consistent mutation.
             state = await loop.run_in_executor(
                 None, _update_state_tags_sync, state, request.tags
             )
-        event_service.stored.updated_at = utc_now()
         record = self._conversation_records.get(conversation_id)
         if record is not None:
             record.stored = event_service.stored
             record.cached_info = None
-        # Save the updated metadata to disk
-        await event_service.save_meta()
 
         # Notify conversation webhooks about the updated conversation. Compose the
         # full-state snapshot under the state lock, but do the synchronous wait in a
@@ -2040,6 +2049,17 @@ class ConversationService:
 
     async def get_event_service(self, conversation_id: UUID) -> EventService | None:
         return await self._get_or_load_event_service(conversation_id)
+
+    async def get_persisted_event_service(
+        self, conversation_id: UUID
+    ) -> EventService | None:
+        """Open append-only event history without acquiring a runtime lease."""
+        if self._event_services is None:
+            raise ValueError("inactive_service")
+        record = self._conversation_records.get(conversation_id)
+        if record is None:
+            return None
+        return EventService.for_persisted_events(record.stored, self.conversations_dir)
 
     async def generate_conversation_title(
         self, conversation_id: UUID, max_length: int = 50, llm: LLM | None = None
@@ -2426,7 +2446,6 @@ class ConversationService:
             conversation_idle_ttl_seconds=config.conversation_idle_ttl_seconds,
             conversation_worktree_root=config.conversation_worktree_root,
             acp_skill_sourcing=config.acp_skill_sourcing,
-            sync_external_catalog=False,
         )
 
     async def _start_event_service(
@@ -2450,7 +2469,7 @@ class ConversationService:
             stored=stored,
             conversations_dir=self.conversations_dir,
             agent=agent,
-            cipher=self.cipher,
+            cipher=self._cipher_for(stored.id),
             mcp_tool_provider=self.mcp_tool_provider,
             credential_bindings=credential_bindings,
             owner_instance_id=self.owner_instance_id,
@@ -2697,9 +2716,12 @@ class AutoTitleSubscriber(Subscriber):
                     _on_title_error,
                 )
                 if title and self.service.stored.title is None:
-                    self.service.stored.title = title
-                    self.service.stored.updated_at = utc_now()
-                    await self.service.save_meta()
+                    await _persist_stored(
+                        self.service,
+                        self.service.stored.model_copy(
+                            update={"title": title, "updated_at": utc_now()}
+                        ),
+                    )
             except Exception:
                 logger.warning(
                     f"Auto-title generation failed for "
