@@ -55,6 +55,7 @@ from openhands.sdk.hooks import HookConfig, HookEventProcessor, create_hook_call
 from openhands.sdk.io import FileStore, LocalFileStore
 from openhands.sdk.llm import LLM, Message, TextContent, content_to_str
 from openhands.sdk.llm.auth.openai import create_subscription_llm_from_config
+from openhands.sdk.llm.exceptions import LLMAuthenticationError
 from openhands.sdk.llm.llm import LLMCallContext
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
 from openhands.sdk.llm.llm_registry import LLMRegistry
@@ -63,8 +64,6 @@ from openhands.sdk.marketplace.registry import MarketplaceRegistry
 from openhands.sdk.mcp.client import MCPClient
 from openhands.sdk.mcp.config import (
     MCPServer,
-    coerce_mcp_config,
-    dump_mcp_config,
     enabled_mcp_servers,
 )
 from openhands.sdk.mcp.tool import MCPToolDefinition
@@ -100,7 +99,7 @@ from openhands.sdk.skills import (
     merge_skills_by_name,
 )
 from openhands.sdk.skills.utils import (
-    expand_mcp_variables,
+    expand_mcp_servers,
     expand_variable_references,
 )
 from openhands.sdk.subagent import (
@@ -1205,16 +1204,13 @@ class LocalConversation(BaseConversation):
         # - Variables with defaults that don't have secrets fall back to their defaults
         # - This is the ONLY place where defaults are applied (plugin loading preserves
         #   placeholders with expand_defaults=False to avoid double-expansion)
+        # Agent Plugins servers are left literal (see expand_mcp_servers).
         if merged_mcp:
             # Pass the registry's lookup method as a callback - secrets are retrieved
             # lazily, one at a time, only when actually referenced in the config
-            expanded_mcp = expand_mcp_variables(
-                {"mcpServers": dump_mcp_config(merged_mcp)},
-                {},
-                get_secret=self._state.secret_registry.get_secret_value,
-                expand_defaults=True,
+            merged_mcp = expand_mcp_servers(
+                merged_mcp, self._state.secret_registry.get_secret_value
             )
-            merged_mcp = coerce_mcp_config(expanded_mcp["mcpServers"])
             logger.debug("Expanded MCP config variables")
 
         # Update agent with merged content only if something changed.
@@ -1447,25 +1443,13 @@ class LocalConversation(BaseConversation):
         get_secret = self._state.secret_registry.get_secret_value
         runtime_plugin_mcp: dict[str, MCPServer] = {}
         if plugin.mcp_config:
-            expanded_plugin_mcp = expand_mcp_variables(
-                {"mcpServers": dump_mcp_config(plugin.mcp_config)},
-                {},
-                get_secret=get_secret,
-                expand_defaults=True,
-            )
-            runtime_plugin_mcp = coerce_mcp_config(expanded_plugin_mcp["mcpServers"])
+            runtime_plugin_mcp = expand_mcp_servers(plugin.mcp_config, get_secret)
         merged_context = plugin.add_skills_to(self.agent.agent_context)
         merged_mcp = plugin.add_mcp_config_to(
             dict(self.agent.mcp_config) if self.agent.mcp_config else {}
         )
         if merged_mcp:
-            expanded_mcp = expand_mcp_variables(
-                {"mcpServers": dump_mcp_config(merged_mcp)},
-                {},
-                get_secret=get_secret,
-                expand_defaults=True,
-            )
-            merged_mcp = coerce_mcp_config(expanded_mcp["mcpServers"])
+            merged_mcp = expand_mcp_servers(merged_mcp, get_secret)
         runtime_mcp_tools = (
             self._runtime_mcp_tools(
                 runtime_plugin_mcp,
@@ -1825,6 +1809,11 @@ class LocalConversation(BaseConversation):
     def send_message(self, message: str | Message, sender: str | None = None) -> None:
         """Send a message to the agent.
 
+        A new user message is not confirmation. If the conversation is
+        ``WAITING_FOR_CONFIRMATION``, pending actions are rejected as
+        superseded. Confirm with ``run()`` and no new message, or deny
+        with ``reject_pending_actions()``.
+
         Args:
             message: Either a string (which will be converted to a user message)
                     or a Message object
@@ -1854,6 +1843,17 @@ class LocalConversation(BaseConversation):
                 self._state.execution_status = (
                     ConversationExecutionStatus.IDLE
                 )  # new message resets terminal states
+            elif (
+                self._state.execution_status
+                == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            ):
+                # New chat text is not an approval gesture. Confirm by calling
+                # run() with no new message; deny via reject_pending_actions().
+                logger.info(
+                    "User message arrived while awaiting "
+                    "confirmation; rejecting the pending action"
+                )
+                self.reject_pending_actions("Superseded by a new user message")
 
             activated_skill_names: list[str] = []
             extended_content: list[TextContent] = []
@@ -1923,6 +1923,8 @@ class LocalConversation(BaseConversation):
         In confirmation mode:
         - First call: creates actions but doesn't execute them, stops and waits
         - Second call: executes pending actions (implicit confirmation)
+        - ``send_message`` while waiting rejects pending actions as superseded;
+          only ``run()`` without a new message is an approval
 
         In normal mode:
         - Creates and executes actions immediately
@@ -2057,6 +2059,21 @@ class LocalConversation(BaseConversation):
                             )
                         )
                         break
+        except LLMAuthenticationError as e:
+            with self._state:
+                self._state.execution_status = ConversationExecutionStatus.ERROR
+                self._on_event(
+                    ConversationErrorEvent(
+                        source="environment",
+                        code="LLMAuthenticationError",
+                        detail=(
+                            "Your LLM API key appears to be invalid or has expired."
+                        ),
+                    )
+                )
+            raise ConversationRunError(
+                self._state.id, e, persistence_dir=self._state.persistence_dir
+            ) from e
         except Exception as e:
             with self._state:
                 self._state.execution_status = ConversationExecutionStatus.ERROR
@@ -2557,6 +2574,21 @@ class LocalConversation(BaseConversation):
 
                 self._state.execution_status = ConversationExecutionStatus.PAUSED
                 self._on_event(InterruptEvent())
+        except LLMAuthenticationError as e:
+            with self._state:
+                self._state.execution_status = ConversationExecutionStatus.ERROR
+                self._on_event(
+                    ConversationErrorEvent(
+                        source="environment",
+                        code="LLMAuthenticationError",
+                        detail=(
+                            "Your LLM API key appears to be invalid or has expired."
+                        ),
+                    )
+                )
+            raise ConversationRunError(
+                self._state.id, e, persistence_dir=self._state.persistence_dir
+            ) from e
         except Exception as e:
             with self._state:
                 updated_agent_state = dict(self._state.agent_state)
