@@ -1,5 +1,6 @@
 """Tests for LLM router."""
 
+import litellm
 import pytest
 from fastapi.testclient import TestClient
 
@@ -54,6 +55,37 @@ async def test_list_models_filtered_by_provider():
     assert len(response.models) < len(all_models_response.models)
 
 
+@pytest.mark.parametrize("openrouter_in_catalog", [False, True])
+def test_list_models_filtered_by_openrouter_provider(
+    client, monkeypatch, openrouter_in_catalog
+):
+    """Verified routes survive catalog removal without leaking direct models."""
+    catalog = [
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
+    ]
+    if openrouter_in_catalog:
+        catalog.append("openrouter/deepseek/deepseek-chat")
+    monkeypatch.setattr(litellm, "model_list", catalog)
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {"openrouter/custom/model": {}} if openrouter_in_catalog else {},
+    )
+
+    response = client.get("/api/llm/models?provider=openrouter")
+
+    assert response.status_code == 200
+    models = response.json()["models"]
+    assert "openrouter/deepseek/deepseek-chat" in models
+    assert all(model.startswith("openrouter/") for model in models)
+    assert models == sorted(set(models))
+    if openrouter_in_catalog:
+        assert "openrouter/custom/model" in models
+    assert set(models) <= set(client.get("/api/llm/models").json()["models"])
+
+
 @pytest.mark.asyncio
 async def test_list_models_unknown_provider():
     """Test listing models with an unknown provider returns empty list."""
@@ -68,6 +100,7 @@ async def test_list_verified_models():
     assert response.models == VERIFIED_MODELS
     assert "openai" in response.models
     assert "anthropic" in response.models
+    assert "openrouter" in response.models
 
 
 def test_providers_endpoint_integration(client):
