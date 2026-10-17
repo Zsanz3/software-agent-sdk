@@ -47,6 +47,7 @@ from openhands.sdk.mcp.config import (
     MCPServer,
 )
 from openhands.sdk.mcp.exceptions import MCPError, MCPTimeoutError
+from openhands.sdk.mcp.oauth import MCPOAuth
 from openhands.sdk.utils.cipher import Cipher
 
 
@@ -346,6 +347,9 @@ class _MCPOAuthProbeJob:
                 "succeeded" if isinstance(result, MCPTestSuccess) else "failed"
             )
         self.done.set()
+        # Also wakes the start route when the probe finished without needing
+        # consent (stored tokens still valid, or refreshed) or failed early.
+        self.authorization_ready.set()
 
     def to_status_response(self) -> MCPOAuthStatusResponse:
         with self.lock:
@@ -440,7 +444,7 @@ def _oauth_auth_from_authentication(
     )
 
 
-class _BrowserCoordinatedOAuth(OAuth):
+class _BrowserCoordinatedOAuth(MCPOAuth):
     """FastMCP OAuth client that lets the frontend own browser navigation."""
 
     def __init__(self, *, job: _MCPOAuthProbeJob, **kwargs: Any):
@@ -708,6 +712,11 @@ async def start_mcp_oauth(
             authorization_url=job.authorization_url,
         )
 
+    if job.done.is_set() and isinstance(job.result, MCPTestSuccess):
+        # No consent was needed: the stored tokens were valid or refreshed.
+        # The caller reads the outcome from the status route.
+        return MCPOAuthStartResponse(ok=True, job_id=job.id)
+
     if job.done.is_set() and isinstance(job.result, MCPTestFailure):
         return MCPOAuthStartResponse(
             ok=False,
@@ -735,7 +744,12 @@ async def get_mcp_oauth_status(job_id: str) -> MCPOAuthStatusResponse:
 
 
 def _validate_callback_url(callback_url: str, job: _MCPOAuthProbeJob) -> None:
-    parsed = urlparse(callback_url)
+    try:
+        parsed = urlparse(callback_url)
+    except ValueError:  # e.g. an unclosed IPv6 bracket
+        raise HTTPException(
+            status_code=400, detail="Invalid OAuth callback URL"
+        ) from None
     if parsed.scheme != "http" or parsed.hostname not in {
         "localhost",
         "127.0.0.1",
@@ -749,7 +763,13 @@ def _validate_callback_url(callback_url: str, job: _MCPOAuthProbeJob) -> None:
         raise HTTPException(status_code=409, detail="OAuth callback is not ready")
 
     expected_parsed = urlparse(expected)
-    if parsed.port != expected_parsed.port or parsed.path != expected_parsed.path:
+    try:
+        port = parsed.port
+    except ValueError:  # out of range or not a number
+        raise HTTPException(
+            status_code=400, detail="Unexpected OAuth callback URL"
+        ) from None
+    if port != expected_parsed.port or parsed.path != expected_parsed.path:
         raise HTTPException(status_code=400, detail="Unexpected OAuth callback URL")
 
 
